@@ -7,7 +7,7 @@ TXT 小说阅读器，支持 edge-tts 多角色语音朗读。
 Windows XP 经典风格界面，沉浸式精简模式。
 
 作者: OpenCode AI
-版本: 1.0
+版本: 1.1
 协议: MIT License
 """
 
@@ -183,10 +183,12 @@ def ensure_dirs():
 class CharacterAnalyzer:
     _QUOTES = '"\u201c\u201d\u300c\u300d\u300e\u300f\uff02'
     DIALOGUE_RE = re.compile(rf'[{_QUOTES}](.+?)[{_QUOTES}]')
-    SPEAKER_RE = re.compile(
-        r'([\u4e00-\u9fff]{2,4}?)'
-        r'(?:说道|笑道|问道|怒道|叹道|喝道|叫道|喊道|大喊|大喊大叫|'
-        r'自言自语|说|道|问|喊|叫|答|讲|曰)')
+    # Name + speech verb
+    _SV = (r'(?:自言自语|大喊大叫|说道|笑道|问道|怒道|叹道|喝道|'
+           r'叫道|喊道|大喊|冷冷道|淡淡道|笑着说|答道|'
+           r'说|道|问|喊|叫|答|讲|曰)')
+    _SPEAKER_RE = re.compile(r'([\u4e00-\u9fff]{2,4}?)' + _SV)
+    _PARA_RE = re.compile(r'\n\s*\n')
 
     @classmethod
     def analyze(cls, text):
@@ -194,78 +196,186 @@ class CharacterAnalyzer:
         _bad_ending = set('地了的着过得都很也不就还又把被让从在对向与和或而因但所如果虽然然则之')
         _common_surname = set('王李张刘陈杨赵黄周吴徐孙马胡朱郭何林高罗郑梁谢宋唐韩冯于董萧程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜范方石姚谭廖邹熊金陆郝白崔康毛邱秦江史顾侯邵孟龙万段雷钱汤尹黎易常武乔贺赖龚文')
         name_counts = Counter()
-        for m in cls.DIALOGUE_RE.finditer(text):
-            start, end = m.start(), m.end()
-            before = text[max(0, start - 40):start]
-            after = text[end:end + 20]
+
+        # Paragraph boundaries
+        para_starts = [0] + [m.end() for m in cls._PARA_RE.finditer(text)]
+
+        def _para_of(pos):
+            for i in range(len(para_starts) - 1):
+                if para_starts[i] <= pos < para_starts[i + 1]:
+                    return para_starts[i], para_starts[i + 1]
+            return para_starts[-1], len(text)
+
+        dialogues = list(cls.DIALOGUE_RE.finditer(text))
+        for i, m in enumerate(dialogues):
+            d_start, d_end = m.start(), m.end()
+            para_start, para_end = _para_of(d_start)
+
+            # Constrained before/after windows (same paragraph, between adjacent dialogues)
+            prev_end = dialogues[i - 1].end() if i > 0 else para_start
+            before_start = max(para_start, prev_end)
+            before = text[before_start:d_start] if before_start < d_start else ""
+
+            next_start = dialogues[i + 1].start() if i + 1 < len(dialogues) else para_end
+            after_end = min(para_end, next_start)
+            after = text[d_end:after_end] if d_end < after_end else ""
+
+            # Search before (closest to dialogue preferred) then after
             found = None
-            for s in cls.SPEAKER_RE.finditer(before):
-                found = s.group(1)
+            pre_matches = list(cls._SPEAKER_RE.finditer(before))
+            if pre_matches:
+                pre_matches.sort(key=lambda x: -x.start())
+                found = pre_matches[0].group(1)
             if not found:
-                m2 = cls.SPEAKER_RE.search(after)
+                m2 = cls._SPEAKER_RE.search(after)
                 if m2:
                     found = m2.group(1)
+
             if found and len(found) >= 2 and not found.isdigit() and found[-1] not in _bad_ending:
                 if len(found) > 2 and found[0] not in _common_surname:
                     continue
                 name_counts[found] += 1
+
         return sorted([n for n, c in name_counts.items() if c >= 1])
 
 
 class ScriptParser:
     DIALOGUE_RE = CharacterAnalyzer.DIALOGUE_RE
-    _SPEECH_VERBS = r'(?:.|\n){0,15}(?:说道|笑道|问道|怒道|叹道|喝道|叫道|喊道|大喊|'
-    _SPEECH_VERBS += r'说|道|问|喊|叫|答|讲|曰)'
+
+    # Speech verb lexicon — used in both pre-dialogue and post-dialogue patterns
+    _SV = (r'(?:自言自语|大喊大叫|说道|笑道|问道|怒道|叹道|喝道|'
+           r'叫道|喊道|大喊|冷冷道|淡淡道|笑着说|答道|'
+           r'说|道|问|喊|叫|答|讲|曰)')
+
+    # Name + (0-8 modifier chars) + speech verb  (before dialogue: "张三笑道…")
+    _PRE_RE = re.compile(r'([\u4e00-\u9fff]{2,4}?).{0,8}?' + _SV)
+    # Name + anything + ：(colon) right before dialogue  (e.g. "张三笑了一声：")
+    _NAME_COLON_RE = re.compile(r'([\u4e00-\u9fff]{2,4}).{0,20}?：(?=["\u201c\u300c\u300e\uff02])')
+
+    # Speech verb + whitespace + name  (after dialogue: '…" 张三说')
+    _POST_RE = re.compile(_SV + r'\s*([\u4e00-\u9fff]{2,4})')
+
+    # Paragraph break pattern
+    _PARA_RE = re.compile(r'\n\s*\n')
 
     @classmethod
     def parse(cls, text, character_voices, narration_voice):
         segments = []
+        char_names = sorted(character_voices.keys(), key=len, reverse=True)
+        dialogues = list(cls.DIALOGUE_RE.finditer(text))
+
+        if not dialogues:
+            if text.strip():
+                segments.append(("旁白", text, narration_voice, 0, len(text)))
+            return segments
+
+        # Paragraph boundary positions (start of each paragraph)
+        para_starts = [0] + [m.end() for m in cls._PARA_RE.finditer(text)]
+        if para_starts[-1] != len(text):
+            para_starts.append(len(text))
+
+        def _para_of(pos):
+            """Return (start, end) of the paragraph containing position `pos`."""
+            for i in range(len(para_starts) - 1):
+                if para_starts[i] <= pos < para_starts[i + 1]:
+                    return para_starts[i], para_starts[i + 1]
+            return para_starts[-2], para_starts[-1]
+
         pos = 0
         active_speaker = None
-        char_names = sorted(character_voices.keys(), key=len, reverse=True)
 
-        for m in cls.DIALOGUE_RE.finditer(text):
-            if m.start() > pos:
-                nar = text[pos:m.start()]
-                if nar.strip():
-                    segments.append(("旁白", nar, narration_voice, pos, m.start()))
-                    for name in char_names:
-                        if name in nar[-40:]:
-                            active_speaker = name
-                            break
+        for i, m in enumerate(dialogues):
+            d_start, d_end = m.start(), m.end()
+            dialogue_text = m.group(1)
+            para_start, para_end = _para_of(d_start)
 
-            dialogue = m.group(1)
-            start, end = m.start(), m.end()
-            before = text[max(0, start - 20):start]
-            after = text[end:end + 20]
+            # ---- Narration gap before this dialogue ----
+            gap = text[pos:d_start]
+            if gap.strip():
+                segments.append(("旁白", gap, narration_voice, pos, d_start))
+                # Track who becomes active in the narration
+                for name in char_names:
+                    look = gap[-60:] if len(gap) >= 60 else gap
+                    if re.search(re.escape(name) + r'.{0,8}'
+                                 r'(?:说|道|问|喊|叫|答|走|看|站|坐|转|回|笑|叹|推|拉|进|出)',
+                                 look):
+                        active_speaker = name
+                        break
+
+            # ---- Constrained search windows (paragraph + adjacent dialogues) ----
+            # Before: (prev dialogue end or para start) → dialogue start
+            prev_end = dialogues[i - 1].end() if i > 0 else para_start
+            before_start = max(para_start, prev_end)
+            before = text[before_start:d_start] if before_start < d_start else ""
+
+            # After: dialogue end → (next dialogue start or para end)
+            next_start = dialogues[i + 1].start() if i + 1 < len(dialogues) else para_end
+            after_end = min(para_end, next_start)
+            after = text[d_end:after_end] if d_end < after_end else ""
+
+            # ---- Speaker attribution (ordered by confidence) ----
             speaker = None
 
-            # Tier 1: Speech verb right after dialogue (most reliable)
-            for name in char_names:
-                pat = re.compile(re.escape(name) + cls._SPEECH_VERBS)
-                if pat.search(after):
+            # Tier 1: speech verb AFTER dialogue  e.g. '"你好" 张三说'
+            post_matches = list(cls._POST_RE.finditer(after))
+            if post_matches:
+                post_matches.sort(key=lambda x: x.start())
+                name = post_matches[0].group(1)
+                if name in character_voices:
                     speaker = name
-                    break
 
-            # Tier 2: Speech verb before dialogue
+            # Tier 2: speech verb near dialogue (name + verb or verb + name)
+            #         search both before and after windows, closest wins
             if not speaker:
+                candidates = []
                 for name in char_names:
-                    pat = re.compile(re.escape(name) + cls._SPEECH_VERBS)
-                    if pat.search(before):
+                    pat = re.compile(re.escape(name) + r'.{0,8}?' + cls._SV)
+                    for pm in pat.finditer(before):
+                        candidates.append((len(before) - pm.end(), name))
+                    for pm in pat.finditer(after):
+                        candidates.append((pm.start() + 1, name))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    speaker = candidates[0][1]
+
+            # Tier 2.5: name + ：(colon) right before dialogue (no speech verb required)
+            #         e.g. '张三笑了一声："xxx"' or '张三冷冷的："xxx"'
+            if not speaker:
+                colon_matches = list(cls._NAME_COLON_RE.finditer(before))
+                if colon_matches:
+                    colon_matches.sort(key=lambda x: -x.start())
+                    name = colon_matches[0].group(1)
+                    if name in character_voices:
+                        speaker = name
+
+            # Tier 3: name near quote marks (≤15 chars before, ≤8 chars after)
+            #         before-window has higher priority (looser window)
+            if not speaker:
+                bt = before[-15:] if len(before) >= 15 else before
+                for name in char_names:
+                    if name in bt:
                         speaker = name
                         break
+                # Only check after-window as fallback, tighter window
+                if not speaker:
+                    ah = after[:8] if len(after) >= 8 else after
+                    for name in char_names:
+                        if name in ah:
+                            speaker = name
+                            break
 
-            # Tier 3: Character name near dialogue (without speech verb)
-            if not speaker:
-                for name in char_names:
-                    if name in before[-8:] or name in after[:8]:
-                        speaker = name
-                        break
+            # Tier 4: inherit active speaker (consecutive dialogue, no attribution)
+            if not speaker and active_speaker and active_speaker in character_voices:
+                # Block inheritance if another character appears in the gap
+                gap_check = before[-60:] if len(before) >= 60 else before
+                other_active = any(
+                    name != active_speaker and name in gap_check
+                    for name in char_names
+                )
+                if not other_active:
+                    speaker = active_speaker
 
-            # Tier 4: Active speaker from narration context
-            if not speaker:
-                speaker = active_speaker
-
+            # ---- Assign voice ----
             if speaker and speaker in character_voices:
                 voice = character_voices[speaker]
                 active_speaker = speaker
@@ -273,9 +383,10 @@ class ScriptParser:
                 voice = narration_voice
                 speaker = "旁白"
 
-            segments.append((speaker, dialogue, voice, start, end))
-            pos = end
+            segments.append((speaker, dialogue_text, voice, d_start, d_end))
+            pos = d_end
 
+        # Trailing narration after last dialogue
         if pos < len(text):
             segments.append(("旁白", text[pos:], narration_voice, pos, len(text)))
 
@@ -496,6 +607,8 @@ class TTSWorker:
         if not self._audio_ok:
             self._emit_status("音频设备不可用")
             return
+        prefetch_thread = None
+        prefetch_path = None
         for i in range(start_index, self._total_count):
             if self._stop_flag:
                 break
@@ -507,13 +620,18 @@ class TTSWorker:
             if not sentence.strip():
                 continue
             self._emit_sentence(i)
-            self._emit_status(f"生成语音... ({i + 1}/{self._total_count})")
             mp3_path = os.path.join(self._temp_dir, f"s_{i}.mp3")
-            try:
-                loop.run_until_complete(self._gen(sentence, mp3_path))
-            except Exception as e:
-                print(f"[TTS] generate error: {e}")
-                mp3_path = None
+            if prefetch_thread is not None and prefetch_path == mp3_path:
+                prefetch_thread.join()
+                prefetch_thread = None
+                prefetch_path = None
+            else:
+                self._emit_status(f"生成语音... ({i + 1}/{self._total_count})")
+                try:
+                    loop.run_until_complete(self._gen(sentence, mp3_path))
+                except Exception as e:
+                    print(f"[TTS] generate error: {e}")
+                    mp3_path = None
             if self._stop_flag:
                 break
             if mp3_path and os.path.exists(mp3_path):
@@ -523,6 +641,15 @@ class TTSWorker:
                 except pygame.error as e:
                     print(f"[TTS] play error: {e}")
                     continue
+                if i + 1 < self._total_count:
+                    next_path = os.path.join(self._temp_dir, f"s_{i + 1}.mp3")
+                    prefetch_thread = threading.Thread(
+                        target=self._gen_async,
+                        args=(sentences[i + 1], next_path),
+                        daemon=True,
+                    )
+                    prefetch_thread.start()
+                    prefetch_path = next_path
                 self._emit_status(f"播放中 ({i + 1}/{self._total_count})")
                 while not self._stop_flag:
                     try:
@@ -617,6 +744,18 @@ class TTSWorker:
         rate_str = f"{int((self.speed - 1.0) * 100):+d}%"
         communicate = edge_tts.Communicate(text, self.voice, rate=rate_str)
         await communicate.save(output_path)
+
+    def _gen_async(self, text, output_path):
+        """Generate TTS audio in a background thread for prefetching."""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            rate_str = f"{int((self.speed - 1.0) * 100):+d}%"
+            communicate = edge_tts.Communicate(text, self.voice, rate=rate_str)
+            loop.run_until_complete(communicate.save(output_path))
+            loop.close()
+        except Exception as e:
+            print(f"[TTS] prefetch error: {e}")
 
     def cleanup(self):
         self._running = False
@@ -900,7 +1039,7 @@ class NovelReaderApp(tk.Tk):
         self.text_area.configure(state="normal")
         self.text_area.delete("1.0", "end")
         self.text_area.insert("end", f"  《{APP_NAME}》 -阅他人，寻自己。\n ", "title_tag")
-        self.text_area.insert("end", "  LevelUpReader v1.0\n")
+        self.text_area.insert("end", "  LevelUpReader v1.1\n")
         self.text_area.insert("end", "  中文TXT 有声小说阅读 · 多角色语音朗读\n\n")
 
         lines = [
@@ -1002,17 +1141,23 @@ class NovelReaderApp(tk.Tk):
             if hasattr(self, '_search_bar') and self._search_bar.winfo_ismapped():
                 self._search_bar.grid_remove()
             self.overrideredirect(True)
-            self.minsize(1, 1)
+            self.minsize(200, 100)
             self.geometry(f"{rw}x{rh}+{rx}+{ry}")
             self._text_frame.place(x=0, y=0, relwidth=1, relheight=1)
             self._text_frame.bind("<Button-1>", self._minimal_drag_start)
             self._text_frame.bind("<B1-Motion>", self._minimal_drag_move)
+            self._text_frame.bind("<Enter>", lambda e: self._minimal_set_cursor(e))
+            self._text_frame.bind("<Motion>", self._minimal_set_cursor)
+            self._text_frame.bind("<Leave>", lambda e: self._minimal_reset_cursor())
             self.focus_force()
         else:
             self.overrideredirect(False)
             self.minsize(200, 120)
             self._text_frame.unbind("<Button-1>")
             self._text_frame.unbind("<B1-Motion>")
+            self._text_frame.unbind("<Enter>")
+            self._text_frame.unbind("<Motion>")
+            self._text_frame.unbind("<Leave>")
             self._text_frame.place_forget()
             self.grid_rowconfigure(2, weight=1)
             self._toolbar.grid()
@@ -1022,18 +1167,103 @@ class NovelReaderApp(tk.Tk):
             self.geometry(self._saved_geo)
             self.focus_force()
 
+    _GRIP_SIZE = 8
+
+    def _minimal_hit_edge(self, event):
+        """Return resize edge(s) as a combination of 'n','s','e','w', or None for drag, or 'drag'."""
+        x, y = event.x, event.y
+        w = self._text_frame.winfo_width()
+        h = self._text_frame.winfo_height()
+        g = self._GRIP_SIZE
+        top = y <= g
+        bot = y >= h - g
+        left = x <= g
+        right = x >= w - g
+
+        # Corners take priority
+        if top and left:
+            return "nw"
+        if top and right:
+            return "ne"
+        if bot and left:
+            return "sw"
+        if bot and right:
+            return "se"
+        if top:
+            return "n"
+        if bot:
+            return "s"
+        if left:
+            return "w"
+        if right:
+            return "e"
+        return "drag"
+
+    _CURSOR_MAP = {
+        "nw": "size_nw_se",
+        "ne": "size_ne_sw",
+        "sw": "size_ne_sw",
+        "se": "size_nw_se",
+        "n":  "size_ns",
+        "s":  "size_ns",
+        "e":  "size_we",
+        "w":  "size_we",
+        "drag": "arrow",
+    }
+
+    def _minimal_set_cursor(self, event):
+        edge = self._minimal_hit_edge(event)
+        cursor = self._CURSOR_MAP.get(edge, "arrow")
+        self._text_frame.configure(cursor=cursor)
+
+    def _minimal_reset_cursor(self):
+        self._text_frame.configure(cursor="arrow")
+
     def _minimal_drag_start(self, event):
-        self._drag_x = event.x_root
-        self._drag_y = event.y_root
+        self._minimal_resize_edge = self._minimal_hit_edge(event)
+        if self._minimal_resize_edge == "drag":
+            self._drag_x = event.x_root
+            self._drag_y = event.y_root
+        else:
+            self._resize_start_x = event.x_root
+            self._resize_start_y = event.y_root
+            self._resize_start_w = self.winfo_width()
+            self._resize_start_h = self.winfo_height()
+            # Keep drag fields for mixed-case sanity
+            self._drag_x = event.x_root
+            self._drag_y = event.y_root
 
     def _minimal_drag_move(self, event):
-        dx = event.x_root - self._drag_x
-        dy = event.y_root - self._drag_y
-        self._drag_x = event.x_root
-        self._drag_y = event.y_root
-        x = self.winfo_x() + dx
-        y = self.winfo_y() + dy
-        self.geometry(f"+{x}+{y}")
+        edge = getattr(self, '_minimal_resize_edge', "drag")
+        if edge == "drag":
+            dx = event.x_root - self._drag_x
+            dy = event.y_root - self._drag_y
+            self._drag_x = event.x_root
+            self._drag_y = event.y_root
+            x = self.winfo_x() + dx
+            y = self.winfo_y() + dy
+            self.geometry(f"+{x}+{y}")
+        else:
+            # Resize
+            dx = event.x_root - self._resize_start_x
+            dy = event.y_root - self._resize_start_y
+            new_w = self._resize_start_w
+            new_h = self._resize_start_h
+            new_x = self.winfo_x()
+            new_y = self.winfo_y()
+
+            if "e" in edge:
+                new_w = max(200, self._resize_start_w + dx)
+            if "s" in edge:
+                new_h = max(100, self._resize_start_h + dy)
+            if "w" in edge:
+                new_w = max(200, self._resize_start_w - dx)
+                new_x = self.winfo_x() + self._resize_start_w - new_w
+            if "n" in edge:
+                new_h = max(100, self._resize_start_h - dy)
+                new_y = self.winfo_y() + self._resize_start_h - new_h
+
+            self.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
 
     def _fix_taskbar(self):
         try:
